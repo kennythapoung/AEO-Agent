@@ -1,0 +1,444 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { createHmac, timingSafeEqual } from "crypto";
+import { createServer } from "http";
+
+// ─── Config (set these as env vars in Render) ────────────────────────────────
+const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const PORT = process.env.PORT || 3000;
+
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+// ─── Deduplication: ignore events we've already processed ────────────────────
+const processedEvents = new Set();
+
+// ─── AEO Knowledge Base (mirrors the React app) ──────────────────────────────
+const AEO_BEST_PRACTICES = `
+You are a senior writer and editor specializing in Answer Engine Optimization (AEO) — helping content get cited, quoted, and surfaced by AI answer engines including Google AI Overviews, ChatGPT, Claude, Gemini, and Perplexity.
+
+## YOUR ROLE AND CONSTRAINTS
+You are a writer and editor, NOT a developer or engineer. Your job is to improve the actual words, structure, and framing of content that consumers will read and that LLMs will crawl.
+
+NEVER recommend:
+- Schema markup or structured data implementation
+- Technical SEO changes (canonical URLs, sitemaps, page speed, Core Web Vitals)
+- Backend or code changes of any kind
+- Anything requiring developer or engineering support
+
+ALWAYS focus on:
+- The words on the page — how they're written, structured, and framed
+- Changes a writer or editor can make directly in a CMS
+- Copy improvements that a non-technical person can implement today
+
+## CONTEXT SENSITIVITY
+Not all content lends itself to an FAQ or Q&A format. Before making structural suggestions, consider what type of content you're analyzing:
+- A brand story or About page should feel human and narrative — don't force Q&A onto it
+- A product page may benefit from benefit-led headlines and clear statements, not question headers
+- A blog post or resource article is a better candidate for question-based headings and answer-first paragraphs
+- A landing page needs directness and clarity, but also persuasion — balance AEO with brand voice
+Tailor your recommendations to what makes sense for this specific content type.
+
+## HOW TO DELIVER RECOMMENDATIONS
+- Recommend a MAXIMUM of 5 improvements
+- Order them from highest to lowest impact across most LLMs
+- For each recommendation, provide:
+  1. What to change and why (brief, plain-English explanation of the AEO rationale)
+  2. A sample copy rewrite as a thought-starter — show, don't just tell
+- Be specific and editorial, not vague and generic
+
+## AEO KNOWLEDGE BASE
+
+### ANSWER-FIRST WRITING
+The single biggest lever for AEO visibility is leading with the answer. AI engines extract chunks of content — they don't read top to bottom. Each section should open with a clear, direct statement that answers the implied question, then provide supporting detail. Semrush research shows that content leading each section with 1-2 sentences that directly answer the heading significantly improves AI citation rates.
+
+### CLARITY AND ENTITY CONSISTENCY
+AI systems build answers by recognizing specific entities — named people, products, companies, and concepts. Vague references confuse LLMs. "The company launched it in 2024" is uncitable. "[Brand name] launched [Product name] in 2024" is citable. Use your brand name, product names, and key terms consistently and explicitly throughout. Never rely on "it," "they," or "this" when referring to your brand or product.
+
+### NATURAL, CONVERSATIONAL LANGUAGE
+AI search queries now average 23 words, compared to Google's 4-word standard. Content that mirrors conversational register performs better. Write in plain, direct language. Use active voice. Keep sentences concise — aim for 20 words or fewer for key claims.
+
+### CONTENT STRUCTURE FOR SCANNABILITY
+LLMs scan content for extractable, standalone passages. Short paragraphs (2-3 sentences max), clear H2 and H3 headings, and bullet points or numbered lists all help AI engines identify and lift relevant sections. Each section should be self-contained — meaning it makes sense even if read without surrounding context.
+
+### E-E-A-T SIGNALS IN COPY
+Including citations, quotations from relevant sources, and statistics can boost source visibility by over 40% across various AI queries. Name your sources inline ("According to [Source]..."), include specific data points with dates, reference real expert perspectives, and write in a way that signals genuine domain knowledge — not marketing speak.
+
+### HEADINGS AS QUESTIONS (WHERE APPROPRIATE)
+For blog posts, resource articles, FAQs, and how-to guides, framing headings as questions improves AEO performance. However, this should not be forced onto product pages, brand narratives, or campaign copy.
+
+### WHAT HURTS AEO VISIBILITY
+- Burying the main point in paragraph three
+- Using pronouns instead of named entities
+- Marketing-speak and unsupported superlatives
+- Long, dense paragraphs with no visual breaks
+- Inconsistent terminology
+- Thin content that doesn't fully answer the implied question
+`;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function extractGdocId(url) {
+  const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
+  return match ? match[1] : null;
+}
+
+function extractUrls(text) {
+  // Match http/https URLs, including Google Docs
+  const urlRegex = /https?:\/\/[^\s<>|"]+/g;
+  return [...new Set(text.match(urlRegex) || [])];
+}
+
+async function fetchFromUrl(targetUrl) {
+  // Use Claude's web_search tool to fetch and extract page content
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 3000,
+    tools: [{ type: "web_search_20250305", name: "web_search" }],
+    messages: [{
+      role: "user",
+      content: `Please fetch and extract the main body text content from this URL: ${targetUrl}
+
+Return ONLY the extracted page text — all the readable content a human would see. Do not summarize, analyze, or comment. Strip navigation menus, footers, cookie banners, and ads. Keep headings, paragraphs, and lists intact.`
+    }],
+  });
+  const text = response.content
+    .filter(b => b.type === "text")
+    .map(b => b.text)
+    .join("\n")
+    .trim();
+  if (!text) throw new Error("Could not extract content from that URL. The page may require login or block crawlers.");
+  return text;
+}
+
+async function fetchFromGdoc(docId) {
+  const exportUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
+  const res = await fetch(exportUrl);
+  if (!res.ok) throw new Error("Could not access the Google Doc. Make sure it's set to 'Anyone with the link can view'.");
+  const text = await res.text();
+  if (!text.trim()) throw new Error("The Google Doc appears to be empty.");
+  return text;
+}
+
+async function runAeoAnalysis(contentToAnalyze, sourceUrl) {
+  const prompt = `${AEO_BEST_PRACTICES}
+
+---
+
+You are now acting as an AEO content editor. Analyze the following content and provide editorial recommendations to improve its visibility across ALL major AI answer engines: Google AI Overviews, ChatGPT, Claude, Gemini, Perplexity, and any other emerging LLM-based answer engines.
+
+${sourceUrl ? `Source URL: ${sourceUrl}` : ""}
+
+IMPORTANT RULES:
+- You are a writer/editor, not a developer. Recommend ONLY copy and content changes — never schema, technical SEO, or anything requiring a developer.
+- Consider the content type carefully. Not all content suits FAQ or Q&A format. 
+- Be mindful of the target audience and industry.
+- Provide a MAXIMUM of 5 recommendations, ordered from highest to lowest impact across most LLMs.
+- For each recommendation, include a concrete sample rewrite as a thought-starter, plus a brief explanation of why it improves AEO visibility.
+- Be specific and editorial. Avoid generic advice.
+
+CONTENT TO ANALYZE:
+"""
+${contentToAnalyze.slice(0, 8000)}
+"""
+
+Respond ONLY with a valid JSON object (no markdown, no backticks):
+{
+  "overallScore": <number 0-100>,
+  "contentType": "<e.g. product page, blog post, about page, FAQ>",
+  "summary": "<2-3 sentence overall editorial assessment>",
+  "strengths": ["<strength 1>", "<strength 2>"],
+  "platforms": {
+    "google": { "score": <0-100> },
+    "chatgpt": { "score": <0-100> },
+    "claude": { "score": <0-100> },
+    "gemini": { "score": <0-100> },
+    "perplexity": { "score": <0-100> }
+  },
+  "recommendations": [
+    {
+      "title": "<short recommendation name>",
+      "impact": "<High | Medium>",
+      "why": "<1-2 sentence AEO rationale>",
+      "sampleCopy": "<concrete rewrite example as a thought-starter>"
+    }
+  ]
+}`;
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 2500,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const raw = response.content[0]?.text || "";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean);
+}
+
+// ─── Format analysis as Slack blocks ─────────────────────────────────────────
+
+function formatSlackBlocks(analysis, sourceUrl) {
+  const score = analysis.overallScore;
+  const scoreBar = buildScoreBar(score);
+  const scoreLabel = score >= 75 ? "Good" : score >= 50 ? "Needs Work" : "Needs Attention";
+
+  const platformEmojis = {
+    google: "G",
+    chatgpt: "⬡",
+    claude: "◉",
+    gemini: "✦",
+    perplexity: "∞",
+  };
+
+  const platformLines = Object.entries(analysis.platforms || {})
+    .map(([id, { score: s }]) => {
+      const bar = buildMiniBar(s);
+      return `${platformEmojis[id] || "·"} *${id.charAt(0).toUpperCase() + id.slice(1)}*  ${bar}  ${s}`;
+    })
+    .join("\n");
+
+  const strengthLines = (analysis.strengths || [])
+    .map(s => `✓ ${s}`)
+    .join("\n");
+
+  const recBlocks = (analysis.recommendations || []).flatMap((rec, i) => [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*${i + 1}. ${rec.title}*  ${rec.impact === "High" ? "🔴 High Impact" : "🟡 Medium Impact"}\n${rec.why}`,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `_✎ Sample copy (thought-starter):_\n> ${rec.sampleCopy}`,
+      },
+    },
+    { type: "divider" },
+  ]);
+
+  return [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*AEO Analysis* ${sourceUrl ? `— <${sourceUrl}|View source>` : ""}\n*Content type:* ${analysis.contentType || "Unknown"}`,
+      },
+    },
+    { type: "divider" },
+    // Score
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Overall Score: ${score}/100* — ${scoreLabel}\n${scoreBar}\n\n${analysis.summary}`,
+      },
+    },
+    { type: "divider" },
+    // Platform scores
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Platform Scores*\n${platformLines}`,
+      },
+    },
+    { type: "divider" },
+    // Strengths
+    ...(strengthLines ? [{
+      type: "section",
+      text: { type: "mrkdwn", text: `*What's Working*\n${strengthLines}` },
+    }, { type: "divider" }] : []),
+    // Recommendations header
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Recommended Edits — Ordered by Impact*` },
+    },
+    ...recBlocks,
+  ];
+}
+
+function buildScoreBar(score) {
+  const filled = Math.round(score / 10);
+  return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${score}%`;
+}
+
+function buildMiniBar(score) {
+  const filled = Math.round(score / 20); // 5-block bar
+  return "█".repeat(filled) + "░".repeat(5 - filled);
+}
+
+// ─── Slack API helpers ────────────────────────────────────────────────────────
+
+async function postSlackMessage(channel, threadTs, blocks, text) {
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+    body: JSON.stringify({
+      channel,
+      thread_ts: threadTs,
+      blocks,
+      text, // fallback for notifications
+    }),
+  });
+  const data = await res.json();
+  if (!data.ok) console.error("Slack postMessage error:", data.error);
+  return data;
+}
+
+async function postSlackText(channel, threadTs, text) {
+  return postSlackMessage(channel, threadTs, undefined, text);
+}
+
+// ─── Verify Slack request signature ──────────────────────────────────────────
+
+function verifySlackSignature(rawBody, timestamp, signature) {
+  if (!SLACK_SIGNING_SECRET) return true; // skip in dev if not set
+  const fiveMinutesAgo = Math.floor(Date.now() / 1000) - 300;
+  if (parseInt(timestamp) < fiveMinutesAgo) return false;
+
+  const sigBase = `v0:${timestamp}:${rawBody}`;
+  const mySignature = "v0=" + createHmac("sha256", SLACK_SIGNING_SECRET)
+    .update(sigBase)
+    .digest("hex");
+
+  try {
+    return timingSafeEqual(Buffer.from(mySignature), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
+// ─── Core event handler ───────────────────────────────────────────────────────
+
+async function handleEvent(event, eventId) {
+  // Only handle app_mention events
+  if (event.type !== "app_mention") return;
+
+  // Deduplicate (Slack can retry events)
+  if (processedEvents.has(eventId)) return;
+  processedEvents.add(eventId);
+  // Clean up old entries after 10 minutes
+  setTimeout(() => processedEvents.delete(eventId), 10 * 60 * 1000);
+
+  const { channel, ts, text, thread_ts } = event;
+  const replyTs = thread_ts || ts; // reply in existing thread or start one
+
+  // Extract URLs from the message
+  const urls = extractUrls(text);
+
+  if (urls.length === 0) {
+    await postSlackText(channel, replyTs,
+      "👋 Hi! Mention me alongside a *live URL* or *Google Doc link* and I'll run an AEO analysis and reply here in thread.\n\nExample: `@AEO Bot https://yoursite.com/blog-post`"
+    );
+    return;
+  }
+
+  // Use the first valid URL found
+  const targetUrl = urls[0];
+  const isGdoc = targetUrl.includes("docs.google.com/document");
+
+  // Post a "thinking" acknowledgement
+  await postSlackText(channel, replyTs,
+    `⟳ Fetching and analyzing ${isGdoc ? "Google Doc" : "page"}... this usually takes 15–30 seconds.`
+  );
+
+  try {
+    let contentToAnalyze;
+
+    if (isGdoc) {
+      const docId = extractGdocId(targetUrl);
+      if (!docId) {
+        await postSlackText(channel, replyTs,
+          "⚠️ That doesn't look like a valid Google Doc URL. Make sure it contains `/document/d/` and is set to *Anyone with the link can view*."
+        );
+        return;
+      }
+      contentToAnalyze = await fetchFromGdoc(docId);
+    } else {
+      contentToAnalyze = await fetchFromUrl(targetUrl);
+    }
+
+    const analysis = await runAeoAnalysis(contentToAnalyze, targetUrl);
+    const blocks = formatSlackBlocks(analysis, targetUrl);
+
+    await postSlackMessage(channel, replyTs, blocks,
+      `AEO Analysis complete — Overall score: ${analysis.overallScore}/100`
+    );
+
+  } catch (err) {
+    console.error("Analysis error:", err);
+    await postSlackText(channel, replyTs,
+      `⚠️ Something went wrong: ${err.message}\n\nIf this is a Google Doc, make sure sharing is set to *Anyone with the link can view*. For live URLs, the page must be publicly accessible.`
+    );
+  }
+}
+
+// ─── Start server ─────────────────────────────────────────────────────────────
+
+const server = createServer(async (req, res) => {
+  // Collect raw body
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const rawBody = Buffer.concat(chunks).toString();
+
+  const url = new URL(req.url, `http://localhost`);
+  const method = req.method;
+
+  // Health check
+  if (url.pathname === "/health") {
+    res.writeHead(200);
+    res.end("OK");
+    return;
+  }
+
+  if (url.pathname !== "/slack/events" || method !== "POST") {
+    res.writeHead(404);
+    res.end("Not found");
+    return;
+  }
+
+  const timestamp = req.headers["x-slack-request-timestamp"] || "";
+  const signature = req.headers["x-slack-signature"] || "";
+
+  if (!verifySlackSignature(rawBody, timestamp, signature)) {
+    res.writeHead(401);
+    res.end("Unauthorized");
+    return;
+  }
+
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    res.writeHead(400);
+    res.end("Bad request");
+    return;
+  }
+
+  // Slack URL verification challenge
+  if (body.type === "url_verification") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ challenge: body.challenge }));
+    return;
+  }
+
+  // Acknowledge immediately — Slack requires a 200 within 3 seconds
+  res.writeHead(200);
+  res.end("OK");
+
+  // Process event asynchronously after responding
+  if (body.type === "event_callback") {
+    handleEvent(body.event, body.event_id).catch(console.error);
+  }
+});
+
+server.listen(Number(PORT), () => {
+  console.log(`AEO Slack bot listening on port ${PORT}`);
+});
